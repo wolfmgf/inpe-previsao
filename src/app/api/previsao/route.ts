@@ -1,72 +1,140 @@
 import { NextResponse } from "next/server";
+import { XMLParser } from "fast-xml-parser";
 
-// --- SIMULADOR DA API DO INPE ---
-// Função que simula dados de previsão semanal para uma determinada latitude e longitude
-function simularDadosINPE(lat: number, lon: number) {
-  const previsoes = [];
-
-  // Gera previsões para 4 semanas
-  for (let i = 1; i <= 4; i++) {
-    // Lógica para simular temperaturas mais realistas
-    const baseMin = 18;
-    const baseMax = 28;
-    // Temperatura mínima simulada com pequena variação
-    const tempMin = Math.floor(baseMin + (Math.random() - 0.5) * 5);
-    // Temperatura máxima simulada com pequena variação
-    const tempMax = Math.floor(baseMax + (Math.random() - 0.5) * 7);
-
-    previsoes.push({
-      semana: i,
-      // Anomalia de temperatura simulada entre -2.5 e +2.5
-      anomalia_temperatura: parseFloat(((Math.random() - 0.5) * 5).toFixed(2)),
-      // Anomalia de precipitação simulada entre -50 e +50
-      anomalia_precipitacao: parseFloat(
-        ((Math.random() - 0.5) * 100).toFixed(2)
-      ),
-      // Temperatura mínima simulada
-      temperatura_minima: tempMin,
-      // Temperatura máxima sempre maior que a mínima
-      temperatura_maxima: tempMax > tempMin ? tempMax : tempMin + 3,
-      // Índice de radiação UV entre 1 e 11
-      radiacao_uv: parseFloat((Math.random() * 10 + 1).toFixed(1)),
-    });
-  }
-  // Retorna objeto simulando resposta da API do INPE
-  return {
-    localidade_aproximada: `Local Próximo a Lat ${lat.toFixed(2)}, Lon ${lon.toFixed(2)}`,
-    data_geracao: new Date().toISOString(),
-    previsoes,
+// Interfaces para os dados do INPE
+interface InpeCidadeInfo {
+  nome: string;
+  uf: string;
+  id: number;
+}
+interface InpePrevisaoDia {
+  dia: string;
+  tempo: string;
+  maxima: number;
+  minima: number;
+  iuv: number;
+}
+interface InpeApiPrevisaoResponse {
+  cidade: {
+    nome: string;
+    uf: string;
+    atualizacao: string;
+    previsao: InpePrevisaoDia | InpePrevisaoDia[];
   };
 }
-// --- FIM DO SIMULADOR ---
 
-// Handler para requisições GET na rota /api/previsao
+// Função de transformação de dados
+const transformarDadosInpe = (dadosApi: InpeApiPrevisaoResponse) => {
+  const previsoes = Array.isArray(dadosApi.cidade.previsao)
+    ? dadosApi.cidade.previsao
+    : [dadosApi.cidade.previsao];
+
+  const dadosTransformados = previsoes.map((dia, index) => ({
+    semana: index + 1,
+    temperatura_minima: dia.minima,
+    temperatura_maxima: dia.maxima,
+    radiacao_uv: dia.iuv,
+    dia: dia.dia,
+    tempo: dia.tempo,
+  }));
+
+  return {
+    localidade_aproximada: `${dadosApi.cidade.nome} - ${dadosApi.cidade.uf}`,
+    data_geracao: new Date(dadosApi.cidade.atualizacao).toISOString(),
+    previsoes: dadosTransformados,
+  };
+};
+
+const normalizarString = (str: string) =>
+  str.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
 export async function GET(request: Request) {
-  // Extrai parâmetros de latitude e longitude da URL
   const { searchParams } = new URL(request.url);
+  let cidadeNome: string | null = searchParams.get("cidade");
   const lat = searchParams.get("lat");
   const lon = searchParams.get("lon");
 
-  // Validação: ambos os parâmetros são obrigatórios
-  if (!lat || !lon) {
+  if (!cidadeNome && (!lat || !lon)) {
     return NextResponse.json(
-      { error: "Latitude (lat) e Longitude (lon) são obrigatórias." },
+      {
+        success: false,
+        message: "É necessário fornecer nome da cidade ou coordenadas.",
+      },
       { status: 400 }
     );
   }
 
-  // Simula um pequeno delay para a resposta da API (1 segundo)
-  await new Promise((resolve) => setTimeout(resolve, 1000));
-
   try {
-    // Gera dados simulados com base nas coordenadas recebidas
-    const dadosSimulados = simularDadosINPE(parseFloat(lat), parseFloat(lon));
-    return NextResponse.json(dadosSimulados);
-  } catch (error) {
-    // Em caso de erro inesperado, retorna erro 500
-    console.error("[API_PREVISAO_ERRO]", error);
+    const parser = new XMLParser({
+      ignoreAttributes: true,
+      parseTagValue: true,
+    });
+
+    if (lat && lon) {
+      const nominatimUrl = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}`;
+      const geoResponse = await fetch(nominatimUrl, {
+        headers: { "User-Agent": "AplicacaoDePrevisaoDoTempo/1.0" },
+      });
+      if (!geoResponse.ok)
+        throw new Error("Falha ao buscar nome do local via geocodificação.");
+      const geoData = await geoResponse.json();
+      const nomeEncontrado =
+        geoData.address?.city ||
+        geoData.address?.town ||
+        geoData.address?.village ||
+        geoData.address?.suburb;
+      if (!nomeEncontrado)
+        throw new Error("Nenhuma cidade encontrada para o local selecionado.");
+      cidadeNome = nomeEncontrado;
+    }
+
+    if (!cidadeNome)
+      throw new Error("Nome da cidade não pôde ser determinado.");
+
+    const cidadeNomeNormalizado = normalizarString(cidadeNome);
+    const listaCidadesUrl = `http://servicos.cptec.inpe.br/XML/listaCidades?city=${encodeURIComponent(cidadeNomeNormalizado)}`;
+    const cidadesResponse = await fetch(listaCidadesUrl);
+    if (!cidadesResponse.ok)
+      throw new Error("API de busca de cidades do INPE falhou.");
+    const cidadesXml = await cidadesResponse.text();
+    const cidadesJson = parser.parse(cidadesXml);
+
+    if (!cidadesJson?.cidades?.cidade) {
+      throw new Error(
+        `Cidade "${cidadeNome}" não encontrada na base de dados do INPE.`
+      );
+    }
+    const primeiraCidadeEncontrada: InpeCidadeInfo = Array.isArray(
+      cidadesJson.cidades.cidade
+    )
+      ? cidadesJson.cidades.cidade[0]
+      : cidadesJson.cidades.cidade;
+    const cityCode = primeiraCidadeEncontrada.id;
+
+    // USANDO O ENDPOINT DE PREVISÃO DE CURTO PRAZO (MAIS ESTÁVEL E COM IUV)
+    const previsaoUrl = `http://servicos.cptec.inpe.br/XML/cidade/${cityCode}/previsao.xml`;
+    const previsaoResponse = await fetch(previsaoUrl, {
+      next: { revalidate: 3600 },
+    });
+    if (!previsaoResponse.ok)
+      throw new Error("API de previsão de tempo do INPE falhou.");
+    const previsaoXml = await previsaoResponse.text();
+    const previsaoJson: InpeApiPrevisaoResponse = parser.parse(previsaoXml);
+
+    if (!previsaoJson?.cidade?.previsao) {
+      throw new Error("INPE não retornou dados de previsão para esta cidade.");
+    }
+
+    const dadosFinais = transformarDadosInpe(previsaoJson);
+    return NextResponse.json({ success: true, data: dadosFinais });
+  } catch (error: unknown) {
+    let errorMessage = "Falha ao processar a previsão.";
+    if (error instanceof Error) {
+      errorMessage = error.message;
+      console.error("[API_PREVISAO_ERRO]", error);
+    }
     return NextResponse.json(
-      { error: "Não foi possível obter os dados da previsão." },
+      { success: false, message: errorMessage },
       { status: 500 }
     );
   }
